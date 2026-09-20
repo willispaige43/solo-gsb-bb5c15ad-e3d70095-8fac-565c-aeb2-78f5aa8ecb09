@@ -2,7 +2,9 @@
 
 基于 **Python + FastAPI + 内存存储** 的策略裁决服务。客户端提交由
 `all`（与）、`any`（或）、`not`（非）以及比较运算组成的策略，每条规则带
-**优先级**与**结论**；服务针对给定事实做裁决，并给出逐节点推导轨迹。
+**优先级**与**结论**；服务针对给定事实做裁决，并给出逐节点推导轨迹。此外支持
+**裁决流（adjudication flows）**：一次请求内联节点图，把多个已存策略按裁决
+状态/结论路由串成链式求值。
 
 ## 语义
 
@@ -74,6 +76,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/v1/policies/{id}/counterfactuals` | 反事实搜索：让裁决唯一变为目标结论的最小修改集 |
 | POST | `/api/v1/policies/{id}/batch-data-plans` | 批量数据方案：让全部 unknown 案例可判定的最小全局字段集合 |
 | POST | `/api/v1/policies/{id}/replacement-preview` | 替换影响预览：候选规则对案例集的业务影响（不写入存储） |
+| POST | `/api/v1/adjudication-flows/evaluate` | 裁决流：内联节点图按裁决状态/结论逐节点路由求值（不写入存储） |
 
 ## 策略结构
 
@@ -403,17 +406,119 @@ curl -s -X POST localhost:8000/api/v1/policies/$PID/replacement-preview \
 `applicant-1` 不受影响；`transition_counts` 完整覆盖全部 3 个案例的迁移
 分布。确认影响后如需真正替换策略，再调用 `PUT /api/v1/policies/{id}`。
 
+## 裁决流示例（adjudication-flows）
+
+一次请求内联提交 `start`、`nodes` 与 `facts`，把多个**已存策略**串成有向
+裁决流：每个节点引用一个策略并声明若干路由，路由按裁决结果（`decided` 的
+具体结论、`unknown`、`conflict`、`no_match`）指向下一节点。执行前整体校验
+节点、路由与策略引用，并**仅对从 `start` 可达的子图**做环检测（发现环返回
+`422`，不可达子图中的环不影响求值）；同一策略可被不同节点合法复用。逐节点
+复用裁决引擎（所有节点共用同一份 `facts`），当前节点没有任何匹配路由时结束。
+**整个过程不写存储**，被引用策略保持不变。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `start` | 非空字符串 | 起始节点 id，必须是 `nodes` 中已定义的节点 |
+| `nodes` | 非空数组（≤1000） | 节点数组，结构见下 |
+| `facts` | object | 全部节点共用的事实（缺省 `{}`，缺失/null 字段为 unknown） |
+
+节点结构：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | 非空字符串 | 节点 id，请求内唯一 |
+| `policy_id` | 非空字符串 | 已存策略 id（不存在返回 `422`） |
+| `routes` | 数组（≤100，缺省 `[]`） | 路由数组，按声明顺序**首个匹配生效** |
+
+路由结构：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `on` | `decided` / `unknown` / `conflict` / `no_match` | 匹配的裁决状态 |
+| `conclusion` | 非空字符串 | 仅 `on == "decided"` 时允许；给出则只匹配该结论，缺省匹配任意 decided 结论 |
+| `next` | 非空字符串 | 下一节点 id，必须已定义 |
+
+语义与约束：
+
+- 同一节点内不允许重复的 `(on, conclusion)` 路由；`decided` 之外的状态不允许
+  携带 `conclusion`；节点与路由均不允许未知键。
+- 校验失败（未知节点/策略引用、重复节点 id、重复路由、可达环等）返回 `422`，
+  响应体为 `{"detail": "Flow validation failed", "errors": [...]}`。
+- 响应字段：`termination_reason`（终止原因，当前恒为 `no_matching_route`）、
+  `final_signature`（终止节点的业务签名，结构与 replacement-preview 的签名
+  一致）、`trace`（有序节点轨迹：`node_id` / `policy_id` / `status` /
+  `conclusion` / `signature` / `matched_route`，末节点 `matched_route` 为
+  `null`）。
+
+```bash
+# 再建一个客户分群策略（沿用“裁决示例”创建的 $PID 作为第一跳）
+PID2=$(curl -s -X POST localhost:8000/api/v1/policies \
+  -H 'Content-Type: application/json' \
+  -d '{"rules":[
+    {"id":"vip-fast-track","priority":10,"conclusion":"fast-track",
+     "expr":{"field":"vip","op":"eq","value":true}},
+    {"id":"standard","priority":1,"conclusion":"standard",
+     "expr":{"field":"channel","op":"eq","value":"online"}}]}' \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+
+curl -s -X POST localhost:8000/api/v1/adjudication-flows/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start": "loan",
+    "nodes": [
+      {"id": "loan", "policy_id": "'"$PID"'",
+       "routes": [
+         {"on": "decided", "conclusion": "approve", "next": "segment"},
+         {"on": "unknown", "next": "segment"}
+       ]},
+      {"id": "segment", "policy_id": "'"$PID2"'"}
+    ],
+    "facts": {"income": 80000, "debt_ratio": 0.2, "vip": true}
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "termination_reason": "no_matching_route",
+  "final_signature": { "status": "decided", "conclusion": "fast-track",
+                       "decided_priority": 10 },
+  "trace": [
+    { "node_id": "loan", "policy_id": "ab12...",
+      "status": "decided", "conclusion": "approve",
+      "signature": { "status": "decided", "conclusion": "approve",
+                     "decided_priority": 10 },
+      "matched_route": { "on": "decided", "conclusion": "approve",
+                         "next": "segment" } },
+    { "node_id": "segment", "policy_id": "cd34...",
+      "status": "decided", "conclusion": "fast-track",
+      "signature": { "status": "decided", "conclusion": "fast-track",
+                     "decided_priority": 10 },
+      "matched_route": null }
+  ]
+}
+```
+
+即：贷款策略判定 `approve` 后按结论路由到分群节点，`vip: true` 使命中
+`fast-track`；分群节点没有路由，流程以 `no_matching_route` 结束。若把
+`facts` 换成 `{}`，贷款节点返回 `unknown`，将命中 `on: "unknown"` 路由，
+而分群节点因缺少 `vip`/`channel` 字段同样以 `unknown` 结束。
+
 ## 项目结构
 
 ```
 app/
   main.py            # FastAPI 路由、健康检查、请求模型
-  validation.py      # 策略结构校验、反事实/批量/替换预览请求校验
+  validation.py      # 策略结构校验、反事实/批量/替换预览/裁决流请求校验
   logic.py           # 三值逻辑、最小决定族、比较可行性
   engine.py          # 优先级分层、冲突/未知/无匹配裁决、轨迹
   counterfactual.py  # 反事实最小修改集枚举、剪枝与稳定排序
   batch.py           # 批量数据方案：逐案裁决、全局最小字段集合组合
   preview.py         # 替换影响预览：业务签名、变化列表与迁移汇总
+  flow.py            # 裁决流：路由匹配、逐节点执行与有序轨迹
   store.py           # 加锁的内存策略存储
 tests/               # 纯标准库 runner，也可用 pytest
 Dockerfile
@@ -430,5 +535,6 @@ python -m pytest tests/ -q
 python3 tests/test_logic.py && python3 tests/test_engine.py && \
 python3 tests/test_api.py && python3 tests/test_counterfactual.py && \
 python3 tests/test_batch_data_plans.py && \
-python3 tests/test_replacement_preview.py
+python3 tests/test_replacement_preview.py && \
+python3 tests/test_adjudication_flows.py
 ```

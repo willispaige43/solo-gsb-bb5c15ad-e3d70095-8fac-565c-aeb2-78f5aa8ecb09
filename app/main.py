@@ -11,12 +11,15 @@ from pydantic import BaseModel, Field
 from .batch import BatchPlanSearchError, batch_data_plans
 from .counterfactual import CounterfactualSearchError, counterfactuals
 from .engine import adjudicate
+from .flow import evaluate_flow
 from .preview import replacement_preview
 from .store import store
 from .validation import (
+    FlowValidationError,
     PolicyValidationError,
     validate_batch_data_plans_request,
     validate_counterfactual_request,
+    validate_flow_request,
     validate_policy,
     validate_replacement_preview_request,
 )
@@ -35,7 +38,11 @@ app = FastAPI(
         "batch data plans: inclusion-minimal global field sets that make "
         "every unknown case decidable. Replacement previews adjudicate a "
         "case set with the stored and candidate rules side by side and "
-        "report the business-impact changes without touching storage."
+        "report the business-impact changes without touching storage. "
+        "Adjudication flows chain stored policies through an inline node "
+        "graph with routes on decided conclusions, unknown, conflict and "
+        "no_match, returning the termination reason, final business "
+        "signature and ordered node trace without touching storage."
     ),
 )
 
@@ -79,6 +86,19 @@ async def batch_plan_search_handler(
         content={
             "detail": "Batch data plan search failed",
             "errors": [str(exc)],
+        },
+    )
+
+
+@app.exception_handler(FlowValidationError)
+async def flow_validation_handler(
+    request: Request, exc: FlowValidationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": "Flow validation failed",
+            "errors": exc.errors,
         },
     )
 
@@ -249,6 +269,37 @@ async def policy_replacement_preview(policy_id: str, request: Request) -> dict:
         "changes": changes,
         "transition_counts": transition_counts,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Adjudication flows
+# --------------------------------------------------------------------------- #
+
+@app.post(f"{API_PREFIX}/adjudication-flows/evaluate", tags=["flows"])
+async def evaluate_adjudication_flow(request: Request) -> dict:
+    """Evaluate an inline adjudication flow against the submitted facts.
+
+    The body inlines ``start``, ``nodes`` (each referencing a stored policy
+    plus verdict-based routes) and the ``facts`` shared by every node.
+    Nodes, routes, policy references and the subgraph reachable from
+    ``start`` (which must be acyclic) are validated before anything runs;
+    the policy store is never modified.
+    """
+    payload = await _json_body(request)
+    start, nodes, facts = validate_flow_request(payload, store.contains)
+
+    policy_by_id: dict[str, dict] = {}
+    for node in nodes:
+        policy_id = node["policy_id"]
+        if policy_id not in policy_by_id:
+            record = store.get(policy_id)
+            if record is None:  # Deleted between validation and execution.
+                raise FlowValidationError(
+                    [f"nodes: policy {policy_id!r} not found"]
+                )
+            policy_by_id[policy_id] = record
+
+    return evaluate_flow(start, nodes, facts, policy_by_id)
 
 
 async def _json_body(request: Request) -> Any:

@@ -57,6 +57,10 @@ class PolicyStore:
         with self._lock:
             return len(self._policies)
 
+    def contains(self, policy_id: str) -> bool:
+        with self._lock:
+            return policy_id in self._policies
+
     def clear(self) -> None:
         """Test helper."""
         with self._lock:
