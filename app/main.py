@@ -11,12 +11,14 @@ from pydantic import BaseModel, Field
 from .batch import BatchPlanSearchError, batch_data_plans
 from .counterfactual import CounterfactualSearchError, counterfactuals
 from .engine import adjudicate
+from .flow import run_flow
 from .preview import replacement_preview
 from .store import store
 from .validation import (
     PolicyValidationError,
     validate_batch_data_plans_request,
     validate_counterfactual_request,
+    validate_flow_request,
     validate_policy,
     validate_replacement_preview_request,
 )
@@ -35,7 +37,10 @@ app = FastAPI(
         "batch data plans: inclusion-minimal global field sets that make "
         "every unknown case decidable. Replacement previews adjudicate a "
         "case set with the stored and candidate rules side by side and "
-        "report the business-impact changes without touching storage."
+        "report the business-impact changes without touching storage. "
+        "Adjudication flows chain stored policies through verdict routes "
+        "and return the termination reason, the final business signature "
+        "and the ordered node trace."
     ),
 )
 
@@ -249,6 +254,28 @@ async def policy_replacement_preview(policy_id: str, request: Request) -> dict:
         "changes": changes,
         "transition_counts": transition_counts,
     }
+
+
+@app.post(f"{API_PREFIX}/adjudication-flows/evaluate", tags=["adjudication"])
+async def evaluate_adjudication_flow(request: Request) -> dict:
+    """Execute an inline adjudication flow over stored policies.
+
+    The body inlines ``start``, ``nodes`` (each referencing a stored
+    policy plus verdict routes) and the shared ``facts``.  Validation
+    covers node and route shape, policy references and cycle-freedom of
+    the subgraph reachable from ``start``.  Every node is adjudicated
+    with the regular engine; the flow ends at the first node whose
+    verdict matches no declared route.  The policy store is only read,
+    never modified.
+    """
+    payload = await _json_body(request)
+    start, nodes, facts = validate_flow_request(payload, store.get)
+    policies: dict[str, dict] = {}
+    for node in nodes:
+        policy_id = node["policy_id"]
+        if policy_id not in policies:
+            policies[policy_id] = store.get(policy_id)
+    return run_flow(start, nodes, facts, policies)
 
 
 async def _json_body(request: Request) -> Any:

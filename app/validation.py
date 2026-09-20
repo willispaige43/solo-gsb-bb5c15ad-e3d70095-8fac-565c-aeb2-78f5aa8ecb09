@@ -7,7 +7,7 @@ human-readable errors (one error per detected problem where practical).
 from __future__ import annotations
 
 from collections import Counter
-from typing import Any
+from typing import Any, Callable, Optional
 
 from .logic import COMPARISONS
 
@@ -19,6 +19,9 @@ MAX_CONCLUSION_LENGTH = 500
 MAX_MAX_CHANGES = 100
 MAX_BATCH_CASES = 1000
 MAX_CASE_ID_LENGTH = 200
+MAX_FLOW_NODES = 500
+MAX_FLOW_ROUTES = 100
+FLOW_ROUTE_STATUSES = ("decided", "unknown", "conflict", "no_match")
 
 
 class PolicyValidationError(ValueError):
@@ -320,3 +323,221 @@ def validate_replacement_preview_request(payload: Any) -> tuple[list[dict], list
     if errors:
         raise PolicyValidationError(errors)
     return rules, cases
+
+
+def validate_flow_request(
+    payload: Any, policy_exists: Callable[[str], Any]
+) -> tuple[str, list[dict], dict]:
+    """Validate an adjudication-flow request body.
+
+    ``policy_exists`` resolves a policy id to the stored record (or a falsy
+    value); it is only consulted, never modified.  Returns the normalized
+    ``(start, nodes, facts)`` tuple where each node is
+    ``{"id", "policy_id", "routes"}`` and each route ``{"on", "next"}``
+    plus ``"conclusion"`` for ``decided`` routes.
+
+    Raises :class:`PolicyValidationError` with one error string per
+    detected problem.  Cycle detection covers only the subgraph reachable
+    from ``start``; cycles among unreachable nodes are not an error.
+    """
+    if not isinstance(payload, dict):
+        raise PolicyValidationError(["request body must be an object"])
+
+    errors: list[str] = []
+
+    facts = payload.get("facts", {})
+    if not isinstance(facts, dict) or not all(
+        isinstance(k, str) for k in facts
+    ):
+        errors.append("facts: must be an object with string keys")
+        facts = {}
+
+    start = payload.get("start")
+    if not isinstance(start, str) or not start.strip():
+        errors.append("start: must be a non-empty string")
+        start = None
+
+    raw_nodes = payload.get("nodes")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+        errors.append("nodes: must be a non-empty array")
+        raw_nodes = []
+    elif len(raw_nodes) > MAX_FLOW_NODES:
+        errors.append(f"nodes: at most {MAX_FLOW_NODES} nodes are allowed")
+
+    id_counts = Counter(
+        node["id"]
+        for node in raw_nodes
+        if isinstance(node, dict) and isinstance(node.get("id"), str)
+    )
+    declared_ids: set[str] = set(id_counts)
+    nodes: list[dict] = []
+
+    for index, node in enumerate(raw_nodes):
+        prefix = f"nodes[{index}]"
+        if not isinstance(node, dict):
+            errors.append(f"{prefix}: must be an object")
+            continue
+        unknown_keys = set(node) - {"id", "policy_id", "routes"}
+        if unknown_keys:
+            errors.append(f"{prefix}: unknown keys {sorted(unknown_keys)}")
+
+        node_id = node.get("id")
+        if not isinstance(node_id, str) or not node_id.strip():
+            errors.append(f"{prefix}.id: must be a non-empty string")
+        elif len(node_id) > MAX_ID_LENGTH:
+            errors.append(
+                f"{prefix}.id: must be at most {MAX_ID_LENGTH} characters"
+            )
+        elif id_counts[node_id] > 1:
+            errors.append(f"{prefix}.id: duplicate node id {node_id!r}")
+
+        policy_id = node.get("policy_id")
+        if not isinstance(policy_id, str) or not policy_id.strip():
+            errors.append(f"{prefix}.policy_id: must be a non-empty string")
+        elif not policy_exists(policy_id):
+            errors.append(
+                f"{prefix}.policy_id: unknown policy {policy_id!r}"
+            )
+
+        routes = _validate_flow_routes(node.get("routes", []), prefix, errors)
+        nodes.append({"id": node_id, "policy_id": policy_id, "routes": routes})
+
+    if declared_ids:
+        if start is not None and start not in declared_ids:
+            errors.append(
+                f"start: no node with id {start!r} declared in nodes"
+            )
+        for index, node in enumerate(nodes):
+            for r_index, route in enumerate(node["routes"]):
+                nxt = route.get("next")
+                if isinstance(nxt, str) and nxt not in declared_ids:
+                    errors.append(
+                        f"nodes[{index}].routes[{r_index}].next: no node "
+                        f"with id {nxt!r} declared in nodes"
+                    )
+
+    if errors:
+        raise PolicyValidationError(errors)
+
+    adjacency = {
+        node["id"]: [route["next"] for route in node["routes"]]
+        for node in nodes
+    }
+    cycle = _find_reachable_cycle(start, adjacency)
+    if cycle is not None:
+        raise PolicyValidationError(
+            [
+                "nodes: cycle detected among nodes reachable from start "
+                f"{start!r}: {' -> '.join(cycle)}"
+            ]
+        )
+
+    return start, nodes, facts
+
+
+def _validate_flow_routes(
+    raw_routes: Any, prefix: str, errors: list[str]
+) -> list[dict]:
+    """Validate one node's ``routes`` array, appending to ``errors``.
+
+    Returns the normalized routes in declaration order.
+    """
+    routes_path = f"{prefix}.routes"
+    if not isinstance(raw_routes, list):
+        errors.append(f"{routes_path}: must be an array")
+        return []
+    if len(raw_routes) > MAX_FLOW_ROUTES:
+        errors.append(
+            f"{routes_path}: at most {MAX_FLOW_ROUTES} routes are allowed"
+        )
+
+    routes: list[dict] = []
+    seen_matches: set[tuple] = set()
+    for index, route in enumerate(raw_routes):
+        r_prefix = f"{routes_path}[{index}]"
+        if not isinstance(route, dict):
+            errors.append(f"{r_prefix}: must be an object")
+            continue
+        unknown_keys = set(route) - {"on", "conclusion", "next"}
+        if unknown_keys:
+            errors.append(f"{r_prefix}: unknown keys {sorted(unknown_keys)}")
+
+        on = route.get("on")
+        if on not in FLOW_ROUTE_STATUSES:
+            errors.append(
+                f"{r_prefix}.on: must be one of "
+                f"{sorted(FLOW_ROUTE_STATUSES)}"
+            )
+            on = None
+
+        conclusion = route.get("conclusion")
+        if on == "decided":
+            if not isinstance(conclusion, str) or not conclusion.strip():
+                errors.append(
+                    f"{r_prefix}.conclusion: 'decided' routes require a "
+                    "non-empty string conclusion"
+                )
+            elif len(conclusion) > MAX_CONCLUSION_LENGTH:
+                errors.append(
+                    f"{r_prefix}.conclusion: must be at most "
+                    f"{MAX_CONCLUSION_LENGTH} characters"
+                )
+        elif "conclusion" in route:
+            errors.append(
+                f"{r_prefix}.conclusion: only allowed on 'decided' routes"
+            )
+
+        nxt = route.get("next")
+        if not isinstance(nxt, str) or not nxt.strip():
+            errors.append(f"{r_prefix}.next: must be a non-empty string")
+            nxt = None
+        elif len(nxt) > MAX_ID_LENGTH:
+            errors.append(
+                f"{r_prefix}.next: must be at most {MAX_ID_LENGTH} characters"
+            )
+
+        if on is not None:
+            match_key = (on, conclusion if on == "decided" else None)
+            if match_key in seen_matches:
+                errors.append(
+                    f"{r_prefix}: duplicate route for the same verdict"
+                )
+            seen_matches.add(match_key)
+
+        normalized: dict[str, Any] = {"on": on}
+        if on == "decided" and isinstance(conclusion, str):
+            normalized["conclusion"] = conclusion
+        normalized["next"] = nxt
+        routes.append(normalized)
+    return routes
+
+
+def _find_reachable_cycle(
+    start: str, adjacency: dict[str, list[str]]
+) -> Optional[list[str]]:
+    """One cycle in the subgraph reachable from ``start``, else ``None``.
+
+    Iterative DFS from ``start``; unreachable nodes are never visited, so
+    cycles outside the reachable subgraph do not count.  The returned cycle
+    is the node path with the repeated node closing the loop.
+    """
+    gray, black = 1, 2
+    state = {start: gray}
+    path = [start]
+    stack = [(start, iter(adjacency.get(start, ())))]
+    while stack:
+        node, edges = stack[-1]
+        for nxt in edges:
+            nxt_state = state.get(nxt)
+            if nxt_state == gray:
+                return path[path.index(nxt):] + [nxt]
+            if nxt_state is None:
+                state[nxt] = gray
+                path.append(nxt)
+                stack.append((nxt, iter(adjacency.get(nxt, ()))))
+                break
+        else:
+            state[node] = black
+            stack.pop()
+            path.pop()
+    return None
